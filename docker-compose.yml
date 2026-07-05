@@ -1,0 +1,12 @@
+services:
+  miner:
+    build: .
+    image: python-cuda-miner:latest
+    container_name: python-cuda-miner
+    env_file:
+      - .env
+    environment:
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+    gpus: all
+    restart: unless-stopped
