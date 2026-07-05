@@ -6,9 +6,10 @@
 #
 # We only need Python + the CUDA/NVRTC toolchain; CuPy is installed separately
 # via requirements-jetson.txt for cp.RawModule JIT.
-FROM nvcr.io/nvidia/pytorch:26.05-py3
+FROM nvcr.io/nvidia/pytorch:26.02-py3-igpu 
 
-ENV PYTHONUNBUFFERED=1 \    NVIDIA_DRIVER_CAPABILITIES=compute,utility \
+ENV PYTHONUNBUFFERED=1 \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility \
     NVIDIA_VISIBLE_DEVICES=all
 
 WORKDIR /app
