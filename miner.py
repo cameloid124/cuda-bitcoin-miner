@@ -3,6 +3,7 @@ import asyncio
 import json
 import struct
 import logging
+import socket
 import time
 import hashlib
 from fractions import Fraction
@@ -20,6 +21,10 @@ NONCE_SPACE = 1 << 32
 # space without recomputing the coinbase, and keeps timestamps fresh. Pools
 # tolerate small forward rolls; kept conservative here.
 NTIME_ROLL = 8
+
+# How often to send an application-level mining.ping to keep the socket active
+# (ckpool and many proxies drop idle connections around 60 s).
+KEEPALIVE_INTERVAL = 30
 
 # =======================================================================
 # CRYPTOGRAPHY & STRATUM HELPERS
@@ -78,6 +83,9 @@ class StratumMiner:
         self.extranonce1 = ""
         self.extranonce2_size = 4
         self.current_difficulty = 1.0
+        self.authorized = False
+        self._pending_job = None
+        self._keepalive_task = None
 
         # Asynchronous Task Management
         self.current_job_task = None
@@ -109,34 +117,97 @@ class StratumMiner:
         if self.current_job_task and not self.current_job_task.done():
             self.current_job_task.cancel()
 
+    def _enable_tcp_keepalive(self):
+        """Enable OS-level TCP keepalive so NAT/middleboxes don't drop idle sockets."""
+        sock = self.writer.get_extra_info("socket")
+        if sock is None:
+            return
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        if hasattr(socket, "TCP_KEEPIDLE"):
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 30)
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10)
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
+
     async def connect(self):
         logging.info(f"[*] Connecting to Stratum pool at {self.host}:{self.port}...")
         self.reader, self.writer = await asyncio.open_connection(self.host, self.port)
+        self._enable_tcp_keepalive()
 
         # Reset per-connection state
         self.pending_requests.clear()
+        self.authorized = False
+        self._pending_job = None
         self.session_start_time = time.time()
         self.total_nonces_hashed = 0
         self.last_log_time = time.time()
 
-        await self.send_message("mining.subscribe", [USER_AGENT])
-        await self.send_message("mining.authorize", [self.username, self.password])
-        await self.listen_for_jobs()
+        if self._keepalive_task:
+            self._keepalive_task.cancel()
+            self._keepalive_task = None
 
-    async def send_message(self, method, params, context=None):
+        # Handshake: wait for each response before treating the session as live.
+        # ckpool (and others) may emit difficulty/job notifications between
+        # subscribe and authorize; buffer the job until auth succeeds.
+        sub_id = await self.send_message("mining.subscribe", [USER_AGENT])
+        auth_id = await self.send_message("mining.authorize", [self.username, self.password])
+        await self._complete_handshake({sub_id, auth_id})
+
+        self.authorized = True
+        if self._pending_job:
+            self._start_job(self._pending_job)
+            self._pending_job = None
+
+        self._keepalive_task = asyncio.create_task(self._keepalive_loop())
+        try:
+            await self.listen_for_jobs()
+        finally:
+            if self._keepalive_task:
+                self._keepalive_task.cancel()
+                self._keepalive_task = None
+
+    async def _complete_handshake(self, pending_ids: set):
+        while pending_ids:
+            msg = await self.read_message()
+            if msg is None:
+                raise ConnectionError("Pool closed connection during handshake.")
+            if msg.get("id") in pending_ids:
+                self.handle_response(msg)
+                pending_ids.discard(msg["id"])
+            else:
+                await self.dispatch_notification(msg, allow_mining=False)
+
+    async def send_message(self, method, params, context=None) -> int:
         self.msg_id += 1
-        self.pending_requests[self.msg_id] = {"method": method, "context": context}
-        payload = {"id": self.msg_id, "method": method, "params": params}
+        req_id = self.msg_id
+        self.pending_requests[req_id] = {"method": method, "context": context}
+        payload = {"id": req_id, "method": method, "params": params}
+        self.writer.write((json.dumps(payload) + '\n').encode('utf-8'))
+        await self.writer.drain()
+        return req_id
+
+    async def send_reply(self, msg_id, result):
+        """Send a JSON-RPC result without registering a pending request."""
+        payload = {"id": msg_id, "result": result, "error": None}
         self.writer.write((json.dumps(payload) + '\n').encode('utf-8'))
         await self.writer.drain()
 
     async def read_message(self):
-        try:
-            line = await self.reader.readline()
-            if not line: return None
-            return json.loads(line.decode('utf-8').strip())
-        except Exception:
-            return None
+        while True:
+            try:
+                line = await self.reader.readline()
+            except Exception as e:
+                logging.warning(f"[POOL] Read error: {e}")
+                return None
+            if not line:
+                return None
+            text = line.decode("utf-8", errors="replace").strip()
+            if not text:
+                continue
+            try:
+                return json.loads(text)
+            except json.JSONDecodeError as e:
+                logging.warning(f"[POOL] Ignoring non-JSON line: {text[:120]!r} ({e})")
+                continue
 
     def handle_response(self, msg):
         """Dispatches a pool response by the method of the request it answers."""
@@ -173,6 +244,51 @@ class StratumMiner:
             else:
                 logging.warning(f"[-] SHARE REJECTED | {share_detail} | error={msg.get('error')}")
 
+    async def dispatch_notification(self, msg, allow_mining=True):
+        """Handle pool-initiated Stratum notifications."""
+        method = msg.get('method')
+
+        if method == 'mining.ping':
+            await self.send_reply(msg.get('id'), "pong")
+            return
+
+        if method == 'client.reconnect':
+            raise ConnectionError("Pool requested reconnect.")
+
+        if method == 'mining.set_difficulty':
+            self.current_difficulty = msg['params'][0]
+            logging.info(f"[POOL] Difficulty adjusted to: {self.current_difficulty}")
+
+        elif method == 'mining.set_extranonce':
+            self.extranonce1 = msg['params'][0]
+            self.extranonce2_size = msg['params'][1]
+            logging.info(f"[POOL] Extranonce updated: {self.extranonce1}")
+
+        elif method == 'mining.notify':
+            if allow_mining and self.authorized:
+                self._start_job(msg['params'])
+            else:
+                self._pending_job = msg['params']
+
+    def _start_job(self, params):
+        job_id = params[0]
+        clean_jobs = params[8]
+        self.cancel_current_job()
+        logging.info(f"[+] Received New Job: {job_id[:8]}... (Clean: {clean_jobs})")
+        self.current_job_task = asyncio.create_task(self.mine_job_loop(params))
+
+    async def _keepalive_loop(self):
+        """Periodic mining.ping keeps the TCP session active through NAT/proxies."""
+        while True:
+            await asyncio.sleep(KEEPALIVE_INTERVAL)
+            try:
+                self.msg_id += 1
+                payload = {"id": self.msg_id, "method": "mining.ping", "params": []}
+                self.writer.write((json.dumps(payload) + '\n').encode('utf-8'))
+                await self.writer.drain()
+            except Exception:
+                break
+
     async def listen_for_jobs(self):
         logging.info("[*] Awaiting data from pool...")
         while True:
@@ -185,28 +301,12 @@ class StratumMiner:
                 self.handle_response(msg)
                 continue
 
-            # --- 2. Server notifications ---
-            method = msg.get('method')
+            # --- 2. Responses to untracked requests (e.g. keepalive ping) ---
+            if msg.get('method') is None and 'result' in msg:
+                continue
 
-            if method == 'mining.set_difficulty':
-                self.current_difficulty = msg['params'][0]
-                logging.info(f"[POOL] Difficulty adjusted to: {self.current_difficulty}")
-
-            elif method == 'mining.set_extranonce':
-                self.extranonce1 = msg['params'][0]
-                self.extranonce2_size = msg['params'][1]
-                logging.info(f"[POOL] Extranonce updated: {self.extranonce1}")
-
-            elif method == 'mining.notify':
-                job_id = msg['params'][0]
-                clean_jobs = msg['params'][8]
-
-                # Always mine the newest job: the previous one is at best
-                # sub-optimal and, if clean_jobs is set, outright stale.
-                self.cancel_current_job()
-
-                logging.info(f"[+] Received New Job: {job_id[:8]}... (Clean: {clean_jobs})")
-                self.current_job_task = asyncio.create_task(self.mine_job_loop(msg['params']))
+            # --- 3. Server notifications ---
+            await self.dispatch_notification(msg)
 
     # -------------------------------------------------------------------
     # HEADER CONSTRUCTION

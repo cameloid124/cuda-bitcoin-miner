@@ -12,7 +12,10 @@ ENV PYTHONUNBUFFERED=1 \
 WORKDIR /app
 
 COPY requirements.txt requirements-jetson.txt ./
-RUN pip install --no-cache-dir -r requirements-jetson.txt
+# NGC PyTorch images ship cupy-cuda12x; remove every CuPy variant before
+# installing cupy-cuda13x for JetPack 7.2 to avoid the dual-package warning.
+RUN pip uninstall -y cupy cupy-cuda12x cupy-cuda13x cupy-cuda11x 2>/dev/null || true \
+    && pip install --no-cache-dir -r requirements-jetson.txt
 
 COPY miner.py cuda_kernel.py ./
 COPY entrypoint.sh /entrypoint.sh

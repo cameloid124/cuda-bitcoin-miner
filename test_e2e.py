@@ -94,6 +94,8 @@ async def serve_client(reader, writer):
                   "error": None if ok else [23, "low difficulty share", None]})
             if shares["accepted"] + shares["rejected"] >= 3:
                 share_event.set()
+        elif method == "mining.ping":
+            send({"id": msg["id"], "result": "pong", "error": None})
         await writer.drain()
 
 

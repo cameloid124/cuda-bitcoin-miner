@@ -45,7 +45,8 @@ docker compose up --build
 ```
 
 Builds `Dockerfile.jetson` (baseline: `nvcr.io/nvidia/pytorch:25.06-py3`, CuPy
-CUDA 13.x for JetPack 7.2).
+CUDA 13.x for JetPack 7.2). The build removes the base image's preinstalled
+`cupy-cuda12x` before installing `cupy-cuda13x`.
 
 **x86_64 desktop / server**
 
