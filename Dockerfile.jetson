@@ -1,20 +1,23 @@
 # Jetson Orin Nano — JetPack 7.2 (L4T 39.2, Ubuntu 24.04, CUDA 13.2).
 #
-# Baseline: NGC PyTorch container (Python 3 + CUDA toolchain). CuPy is installed
-# separately via requirements-jetson.txt (cupy-cuda13x) to match the JP 7.2
-# driver stack; JP 6.x / CUDA 12.x containers are not compatible with JP 7.2.
-FROM nvcr.io/nvidia/pytorch:25.06-py3
+# Baseline: NGC PyTorch 26.05 (CUDA 13.2.1, Ubuntu 24.04). From 26.03 onward
+# NVIDIA ships a unified multi-arch container instead of separate -igpu tags;
+# see https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-26-05.html
+#
+# We only need Python + the CUDA/NVRTC toolchain; CuPy is installed separately
+# via requirements-jetson.txt for cp.RawModule JIT.
+FROM nvcr.io/nvidia/pytorch:26.05-py3
 
-ENV PYTHONUNBUFFERED=1 \
-    NVIDIA_DRIVER_CAPABILITIES=compute,utility \
+ENV PYTHONUNBUFFERED=1 \    NVIDIA_DRIVER_CAPABILITIES=compute,utility \
     NVIDIA_VISIBLE_DEVICES=all
 
 WORKDIR /app
 
 COPY requirements.txt requirements-jetson.txt ./
-# NGC PyTorch images ship cupy-cuda12x; remove every CuPy variant before
-# installing cupy-cuda13x for JetPack 7.2 to avoid the dual-package warning.
-RUN pip uninstall -y cupy cupy-cuda12x cupy-cuda13x cupy-cuda11x 2>/dev/null || true \
+# NGC PyTorch images may ship CuPy and pin versions in /etc/pip/constraint.txt.
+# Remove any CuPy constraints/variants, then install cupy-cuda13x for JP 7.2.
+RUN sed -i '/^cupy/d' /etc/pip/constraint.txt 2>/dev/null || true \
+    && pip uninstall -y cupy cupy-cuda12x cupy-cuda13x cupy-cuda11x 2>/dev/null || true \
     && pip install --no-cache-dir -r requirements-jetson.txt
 
 COPY miner.py cuda_kernel.py ./

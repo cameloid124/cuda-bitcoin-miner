@@ -44,9 +44,13 @@ cp .env.example .env    # set STRATUM_URL, STRATUM_USER, STRATUM_PASSWORD
 docker compose up --build
 ```
 
-Builds `Dockerfile.jetson` (baseline: `nvcr.io/nvidia/pytorch:25.06-py3`, CuPy
-CUDA 13.x for JetPack 7.2). The build removes the base image's preinstalled
-`cupy-cuda12x` before installing `cupy-cuda13x`.
+Builds `Dockerfile.jetson` (baseline: `nvcr.io/nvidia/pytorch:26.05-py3`, CUDA
+13.2.1 / Ubuntu 24.04, CuPy CUDA 13.x). From NGC PyTorch **26.03** onward
+NVIDIA no longer publishes separate `-igpu` container tags; Jetson Orin uses the
+same unified multi-arch image (see [PyTorch 26.05 release
+notes](https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-26-05.html)).
+The build strips any preinstalled CuPy from the base image before installing
+`cupy-cuda13x`.
 
 **x86_64 desktop / server**
 
@@ -63,7 +67,7 @@ Pool credentials are read from `.env` (`STRATUM_URL`, `STRATUM_USER`,
 
 | File | Platform | Base image | CuPy |
 |---|---|---|---|
-| `Dockerfile.jetson` | ARM64 / Jetson | `nvcr.io/nvidia/pytorch:25.06-py3` | `cupy-cuda13x[ctk]` |
+| `Dockerfile.jetson` | ARM64 / Jetson | `nvcr.io/nvidia/pytorch:26.05-py3` | `cupy-cuda13x[ctk]` |
 | `Dockerfile.x86` | x86_64 | `nvidia/cuda:12.6.3-runtime-ubuntu22.04` | `cupy-cuda12x[ctk]` |
 
 Optional `.env` overrides for the default (Jetson) stack:
@@ -212,11 +216,10 @@ bounded forward window.
 
 ### Platform notes
 
-- **JetPack 7.2** ships CUDA **13.2** and an ARM SBSA toolkit. Containers built
-  for JetPack 6.x / CUDA 12.6 are **not** compatible with JP 7.2 hosts; the
-  Jetson image therefore installs `cupy-cuda13x[ctk]` even though its NGC
-  PyTorch baseline (`25.06-py3`) predates JP 7.2 — the CuPy wheel brings the
-  matching CUDA 13.x runtime and NVRTC components needed for kernel JIT.
+- **JetPack 7.2** ships CUDA **13.2** and an ARM SBSA toolkit. Use the unified
+  NGC PyTorch **26.05+** container (`26.05-py3`, not `-igpu` — standalone iGPU
+  tags were discontinued from 26.03). Containers built for JetPack 6.x /
+  CUDA 12.6 are **not** compatible with JP 7.2 hosts.
 - **Jetson Orin** is compute capability **8.7**. The CUDA kernel is compiled at
   import time via NVRTC for the active device, so no architecture-specific
   binary is baked into the image.
