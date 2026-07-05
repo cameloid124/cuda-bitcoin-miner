@@ -1,0 +1,3 @@
+# CUDA 12.x desktop / server GPUs. [ctk] bundles NVRTC + runtime wheels for cp.RawModule.
+-r requirements.txt
+cupy-cuda12x[ctk]>=13.0,<15.0

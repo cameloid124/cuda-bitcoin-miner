@@ -1,4 +1,4 @@
-# CUDA 12 runtime + NVRTC (required by CuPy RawModule JIT compilation).
+# x86_64 desktop / server NVIDIA GPUs (CUDA 12.x).
 FROM nvidia/cuda:12.6.3-runtime-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -14,8 +14,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-COPY requirements.txt .
-RUN pip3 install --no-cache-dir -r requirements.txt
+COPY requirements.txt requirements-x86.txt ./
+RUN pip3 install --no-cache-dir -r requirements-x86.txt
 
 COPY miner.py cuda_kernel.py ./
 COPY entrypoint.sh /entrypoint.sh

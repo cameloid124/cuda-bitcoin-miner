@@ -1,0 +1,21 @@
+# Jetson Orin Nano — JetPack 7.2 (L4T 39.2, Ubuntu 24.04, CUDA 13.2).
+#
+# Baseline: NGC PyTorch container (Python 3 + CUDA toolchain). CuPy is installed
+# separately via requirements-jetson.txt (cupy-cuda13x) to match the JP 7.2
+# driver stack; JP 6.x / CUDA 12.x containers are not compatible with JP 7.2.
+FROM nvcr.io/nvidia/pytorch:25.06-py3
+
+ENV PYTHONUNBUFFERED=1 \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility \
+    NVIDIA_VISIBLE_DEVICES=all
+
+WORKDIR /app
+
+COPY requirements.txt requirements-jetson.txt ./
+RUN pip install --no-cache-dir -r requirements-jetson.txt
+
+COPY miner.py cuda_kernel.py ./
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+ENTRYPOINT ["/entrypoint.sh"]

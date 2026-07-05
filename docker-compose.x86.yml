@@ -1,0 +1,8 @@
+# Override for x86_64 desktop / server hosts (CUDA 12.x).
+# Usage: docker compose -f docker-compose.yml -f docker-compose.x86.yml up --build
+services:
+  miner:
+    build:
+      dockerfile: Dockerfile.x86
+    image: python-cuda-miner:x86
+    platform: linux/amd64

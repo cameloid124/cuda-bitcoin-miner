@@ -1,12 +1,26 @@
+# Default: Jetson Orin (ARM64, JetPack 7.2).
+# For x86_64 hosts: docker compose -f docker-compose.yml -f docker-compose.x86.yml up --build
 services:
   miner:
-    build: .
-    image: python-cuda-miner:latest
+    build:
+      context: .
+      dockerfile: ${MINER_DOCKERFILE:-Dockerfile.jetson}
+    image: python-cuda-miner:${MINER_IMAGE_TAG:-jetson}
     container_name: python-cuda-miner
+    platform: ${DOCKER_PLATFORM:-linux/arm64}
+    runtime: nvidia
     env_file:
       - .env
     environment:
       NVIDIA_VISIBLE_DEVICES: all
       NVIDIA_DRIVER_CAPABILITIES: compute,utility
     gpus: all
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu, utility, compute]
+    shm_size: "256m"
     restart: unless-stopped

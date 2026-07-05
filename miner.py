@@ -8,11 +8,18 @@ import hashlib
 from fractions import Fraction
 from urllib.parse import urlparse
 
-from cuda_kernel import (
-    prepare_job, set_target, scan_nonce_range, get_gpu_info, NONCES_PER_LAUNCH,
-)
+from cuda_kernel import GpuScanner, get_gpu_info, NONCES_PER_LAUNCH
 
 USER_AGENT = "python-cuda-miner/1.0"
+
+# Full 32-bit header nonce space, swept in NONCES_PER_LAUNCH-sized batches.
+NONCE_SPACE = 1 << 32
+
+# ntime rolling: for each extranonce2 (fixed coinbase / merkle root) we also
+# scan a small window of incremented ntime values. This extends the search
+# space without recomputing the coinbase, and keeps timestamps fresh. Pools
+# tolerate small forward rolls; kept conservative here.
+NTIME_ROLL = 8
 
 # =======================================================================
 # CRYPTOGRAPHY & STRATUM HELPERS
@@ -79,6 +86,9 @@ class StratumMiner:
         self.session_start_time = 0
         self.total_nonces_hashed = 0
         self.last_log_time = 0
+
+        # GPU
+        self.scanner = GpuScanner()
 
     async def run(self):
         """Main entry point with reconnect resiliency."""
@@ -236,9 +246,15 @@ class StratumMiner:
     # -------------------------------------------------------------------
 
     async def mine_job_loop(self, params):
-        """Scans the full 2^32 nonce space per extranonce2, then rolls
-        extranonce2, until cancelled by a new job or disconnect."""
+        """For each extranonce2, sweeps the full 2^32 nonce space across a
+        small window of rolled ntime values, then advances extranonce2, until
+        cancelled by a new job or disconnect."""
         job_id, prevhash, coinb1, coinb2, merkle_branch, version, nbits, ntime, _ = params[:9]
+        ntime_base = int(ntime, 16)
+
+        self.uploaded_difficulty = self.current_difficulty
+        target_bytes = diff_to_target(self.uploaded_difficulty)
+        self.target_int = int.from_bytes(target_bytes, 'big')
 
         extranonce2_int = 0
         max_extranonce2 = (2 ** (self.extranonce2_size * 8)) - 1
@@ -246,45 +262,70 @@ class StratumMiner:
         try:
             while extranonce2_int <= max_extranonce2:
                 extranonce2_hex = f"{extranonce2_int:0{self.extranonce2_size * 2}x}"
-
                 merkle_root = self.compute_merkle_root(coinb1, coinb2, merkle_branch, extranonce2_hex)
-                header_prefix = self.pack_header_prefix(version, prevhash, merkle_root, ntime, nbits)
 
-                uploaded_difficulty = self.current_difficulty
-                target_bytes = diff_to_target(uploaded_difficulty)
-                target_int = int.from_bytes(target_bytes, 'big')
-
-                # Upload midstate + header tail + target once per extranonce2
-                await asyncio.to_thread(prepare_job, header_prefix, target_bytes)
-
-                nonce_base = 0
-                while nonce_base < 2 ** 32:
-                    # Pick up mid-job difficulty changes without re-hashing anything
-                    if self.current_difficulty != uploaded_difficulty:
-                        uploaded_difficulty = self.current_difficulty
-                        target_bytes = diff_to_target(uploaded_difficulty)
-                        target_int = int.from_bytes(target_bytes, 'big')
-                        await asyncio.to_thread(set_target, target_bytes)
-
-                    # Offload one 2^24-nonce batch to the GPU (yields event loop)
-                    candidates, elapsed = await asyncio.to_thread(scan_nonce_range, nonce_base)
-
-                    self.total_nonces_hashed += NONCES_PER_LAUNCH
-                    self.log_telemetry(job_id, elapsed)
-
-                    for nonce in candidates:
-                        await self.verify_and_submit(
-                            header_prefix, target_int, nonce, job_id, extranonce2_hex, ntime)
-
-                    nonce_base += NONCES_PER_LAUNCH
+                for roll in range(NTIME_ROLL):
+                    ntime_hex = f"{ntime_base + roll:08x}"
+                    header_prefix = self.pack_header_prefix(
+                        version, prevhash, merkle_root, ntime_hex, nbits)
+                    await self.scan_header(header_prefix, job_id, extranonce2_hex, ntime_hex)
 
                 extranonce2_int += 1
 
         except asyncio.CancelledError:
-            # Expected: pool pushed a new job or the connection dropped
-            pass
+            # Expected: pool pushed a new job or the connection dropped.
+            # Drain the pipeline so the next job starts from a clean scanner.
+            await self.drain_pipeline()
+            raise
         except Exception as e:
             logging.error(f"Error in mining loop: {e}")
+
+    async def scan_header(self, header_prefix, job_id, extranonce2_hex, ntime_hex):
+        """Double-buffered sweep of the full nonce space for one fixed header
+        prefix. Two batches are kept in flight so the GPU never idles between
+        launches."""
+        target_bytes = diff_to_target(self.uploaded_difficulty)
+        await asyncio.to_thread(self.scanner.prepare_job, header_prefix, target_bytes)
+
+        nonce_bases = range(0, NONCE_SPACE, NONCES_PER_LAUNCH)
+        submitted = 0
+
+        # Prime the pipeline with the first batch.
+        await asyncio.to_thread(self.scanner.submit, nonce_bases[0])
+        submitted = 1
+
+        while self.scanner.in_flight:
+            # Keep two batches in flight whenever more work remains.
+            if submitted < len(nonce_bases):
+                await asyncio.to_thread(self.scanner.submit, nonce_bases[submitted])
+                submitted += 1
+
+            await self.maybe_update_target()
+
+            batch_start = time.perf_counter()
+            _, candidates = await asyncio.to_thread(self.scanner.collect)
+            elapsed = time.perf_counter() - batch_start
+
+            self.total_nonces_hashed += NONCES_PER_LAUNCH
+            self.log_telemetry(job_id, elapsed)
+
+            for nonce in candidates:
+                await self.verify_and_submit(
+                    header_prefix, self.target_int, nonce, job_id, extranonce2_hex, ntime_hex)
+
+    async def maybe_update_target(self):
+        """Applies a mid-job difficulty change without discarding any work
+        (only the 32-byte target is re-uploaded)."""
+        if self.current_difficulty != self.uploaded_difficulty:
+            self.uploaded_difficulty = self.current_difficulty
+            target_bytes = diff_to_target(self.uploaded_difficulty)
+            self.target_int = int.from_bytes(target_bytes, 'big')
+            await asyncio.to_thread(self.scanner.set_target, target_bytes)
+
+    async def drain_pipeline(self):
+        """Collects any batches still in flight so the scanner is left empty."""
+        while self.scanner.in_flight:
+            await asyncio.to_thread(self.scanner.collect)
 
     async def verify_and_submit(self, header_prefix, target_int, nonce, job_id, extranonce2_hex, ntime):
         """Re-verifies a GPU candidate on the CPU, then submits it."""
@@ -339,10 +380,10 @@ async def main():
     args = parse_args()
     logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s', datefmt='%H:%M:%S')
 
-    gpu_name, cuda_version = get_gpu_info()
+    gpu_name, cuda_version, driver_version = get_gpu_info()
     logging.info(f"=====================================")
     logging.info(f" Python CUDA Miner Initialized")
-    logging.info(f" GPU: {gpu_name} (CUDA {cuda_version})")
+    logging.info(f" GPU: {gpu_name} (Driver {driver_version}, CUDA {cuda_version})")
     logging.info(f"=====================================")
 
     parsed_url = urlparse(args.url)
