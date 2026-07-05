@@ -11,8 +11,9 @@ import struct
 import subprocess
 from collections import deque
 from ctypes import CDLL, addressof, c_uint32, create_string_buffer
+from pathlib import Path
 
-from cuda_driver import CudaDriver, CUDAError
+from cuda_driver import CudaDriver, CUDAError, KernelLoadInfo
 
 # =======================================================================
 # HOST-SIDE SHA-256 (midstate + early-round precomputation)
@@ -333,13 +334,23 @@ def _get_nvidia_driver_version() -> str:
     return "Unknown"
 
 
+def format_kernel_load_info(info: KernelLoadInfo) -> str:
+    """Formats the loaded kernel artifact for startup diagnostics."""
+    if info.kind == "ptx":
+        return f"PTX ({info.artifact}, driver JIT)"
+    # e.g. kernels/cubin/sm_89.cubin → sm_89
+    stem = Path(info.artifact).stem
+    return f"cubin {stem} ({info.artifact})"
+
+
 def get_gpu_info():
-    """Returns (gpu_name, cuda_version, driver_version)."""
+    """Returns (gpu_name, cuda_version, driver_version, kernel_load_desc)."""
     try:
         cuda = CudaDriver.instance()
         gpu_name = cuda.get_device_name()
         cuda_version = _format_cuda_version(cuda.get_driver_version())
         driver_version = _get_nvidia_driver_version()
-        return gpu_name, cuda_version, driver_version
+        kernel_desc = format_kernel_load_info(cuda.kernel_load_info)
+        return gpu_name, cuda_version, driver_version, kernel_desc
     except (CUDAError, OSError):
-        return "Unknown GPU", "Unknown", "Unknown"
+        return "Unknown GPU", "Unknown", "Unknown", "Unknown"

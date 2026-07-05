@@ -524,10 +524,11 @@ async def main():
     args = parse_args()
     logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s', datefmt='%H:%M:%S')
 
-    gpu_name, cuda_version, driver_version = get_gpu_info()
+    gpu_name, cuda_version, driver_version, kernel_desc = get_gpu_info()
     logging.info(f"=====================================")
     logging.info(f" Python CUDA Miner Initialized")
     logging.info(f" GPU: {gpu_name} (Driver {driver_version}, CUDA {cuda_version})")
+    logging.info(f" Kernel: {kernel_desc}")
     logging.info(f"=====================================")
 
     parsed_url = urlparse(args.url)

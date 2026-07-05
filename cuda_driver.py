@@ -5,6 +5,7 @@ import ctypes
 import sys
 import threading
 from pathlib import Path
+from typing import NamedTuple
 
 # ---------------------------------------------------------------------------
 # Types and constants (Driver API)
@@ -25,6 +26,13 @@ CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR = 76
 KERNELS_DIR = Path(__file__).resolve().parent / "kernels"
 PTX_PATH = KERNELS_DIR / "sha256d_mine.ptx"
 CUBIN_DIR = KERNELS_DIR / "cubin"
+
+
+class KernelLoadInfo(NamedTuple):
+    """Describes which kernel artifact was loaded into the CUDA driver."""
+
+    kind: str       # "ptx" or "cubin"
+    artifact: str   # repo-relative path, e.g. kernels/sha256d_mine.ptx
 
 
 class CUDAError(Exception):
@@ -70,6 +78,7 @@ class CudaDriver:
         self._ctx_bound = threading.local()
         self._bind_context()
 
+        self._kernel_load_info: KernelLoadInfo | None = None
         self._module = self._load_mining_module()
         func = ctypes.c_void_p()
         self._check(
@@ -77,6 +86,12 @@ class CudaDriver:
             "cuModuleGetFunction",
         )
         self._mine_function = func
+
+    @property
+    def kernel_load_info(self) -> KernelLoadInfo:
+        if self._kernel_load_info is None:
+            raise CUDAError("Mining kernel was not loaded.")
+        return self._kernel_load_info
 
     # ------------------------------------------------------------------
     # Module loading
@@ -87,7 +102,9 @@ class CudaDriver:
 
         if PTX_PATH.is_file():
             try:
-                return self._load_module_bytes(PTX_PATH.read_bytes(), text=True)
+                module = self._load_module_bytes(PTX_PATH.read_bytes(), text=True)
+                self._kernel_load_info = KernelLoadInfo("ptx", self._rel_artifact(PTX_PATH))
+                return module
             except CUDAError as exc:
                 errors.append(f"PTX: {exc}")
 
@@ -95,7 +112,9 @@ class CudaDriver:
         cubin_path = CUBIN_DIR / f"sm_{major}{minor}.cubin"
         if cubin_path.is_file():
             try:
-                return self._load_module_bytes(cubin_path.read_bytes(), text=False)
+                module = self._load_module_bytes(cubin_path.read_bytes(), text=False)
+                self._kernel_load_info = KernelLoadInfo("cubin", self._rel_artifact(cubin_path))
+                return module
             except CUDAError as exc:
                 errors.append(f"cubin ({cubin_path.name}): {exc}")
         else:
@@ -106,6 +125,13 @@ class CudaDriver:
         raise CUDAError(
             f"Could not load mining kernel ({detail}). {hint}"
         )
+
+    @staticmethod
+    def _rel_artifact(path: Path) -> str:
+        try:
+            return path.relative_to(KERNELS_DIR.parent).as_posix()
+        except ValueError:
+            return path.as_posix()
 
     def _load_module_bytes(self, data: bytes, *, text: bool) -> ctypes.c_void_p:
         module = ctypes.c_void_p()
