@@ -21,7 +21,12 @@ COPY kernels/ /app/kernels/
 # Alias resolved by KERNEL_SOURCE; BuildKit only builds the selected stage.
 FROM kernels-${KERNEL_SOURCE} AS kernels
 
-FROM nvcr.io/nvidia/cuda:13.2.0-base-ubuntu24.04
+# Plain Ubuntu — NOT nvcr.io/nvidia/cuda:* on Jetson/Tegra.
+# Generic CUDA container images ship libcuda forward-compat ELF notes that
+# trigger a known nvidia-container-toolkit cudacompat panic on Orin
+# (slice bounds out of range in cuda-elf-header.go). The miner needs only
+# Python; libcuda.so.1 is injected from the host by runtime: nvidia.
+FROM ubuntu:24.04
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \

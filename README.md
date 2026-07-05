@@ -77,12 +77,14 @@ Pool credentials are read from `.env` (`STRATUM_URL`, `STRATUM_USER`,
 
 | File | Platform | Runtime base image | Runtime deps |
 |---|---|---|---|
-| `Dockerfile.jetson` | ARM64 / Jetson | `nvcr.io/nvidia/cuda:13.2.0-base-ubuntu24.04` | Python 3 stdlib |
+| `Dockerfile.jetson` | ARM64 / Jetson | `ubuntu:24.04` (no in-image CUDA libs) | Python 3 stdlib |
 | `Dockerfile.x86` | x86_64 | `nvidia/cuda:12.6.3-base-ubuntu22.04` | Python 3 stdlib |
 
-The runtime images use the CUDA **base** variant (a few hundred MB): the miner
-talks to the GPU through `libcuda.so.1`, injected by the NVIDIA container
-runtime, so cudart and the CUDA math libraries are not needed in the image.
+The runtime images use the CUDA **base** variant on x86 (a few hundred MB).
+Jetson uses plain **Ubuntu 24.04** instead: generic `nvcr.io/nvidia/cuda:*`
+images trigger a [known `nvidia-cdi-hook` panic on Orin](https://github.com/NVIDIA/nvidia-container-toolkit/issues/1271)
+during container start. The miner talks to the GPU through `libcuda.so.1`
+injected by the host runtime, so no CUDA packages are needed inside the image.
 
 Optional `.env` overrides for the default (Jetson) stack:
 
@@ -241,9 +243,13 @@ bounded forward window.
   PTX, the JIT fails and the loader automatically falls back to a matching
   native cubin from `kernels/cubin/` (shipped for sm_75, sm_86, sm_87 —
   Jetson Orin, sm_89, sm_90).
-- **JetPack 7.2** ships CUDA **13.2**. The Jetson runtime image is
-  `nvcr.io/nvidia/cuda:13.2.0-base-ubuntu24.04`; the optional kernel builder
-  stage (`KERNEL_SOURCE=build`) uses the matching `-devel-` variant.
+- **JetPack 7.2 / Jetson Orin.** Runtime image is `ubuntu:24.04`; optional
+  kernel builder (`KERNEL_SOURCE=build`) uses
+  `nvcr.io/nvidia/cuda:13.2.0-devel-ubuntu24.04`. Orin loads the prebuilt
+  `kernels/cubin/sm_87.cubin` if PTX JIT is unavailable. If container start
+  still fails with a `cudacompat` / `slice bounds out of range` panic, update
+  the host `nvidia-container-toolkit` to a release that includes
+  [PR #1804](https://github.com/NVIDIA/nvidia-container-toolkit/pull/1804).
 - **Jetson Orin** is compute capability **8.7**; desktop Ada (e.g. RTX 4060) is
   **8.9**. Both JIT the shipped PTX without a rebuild.
 - **x86_64** hosts use `docker-compose.x86.yml` (CUDA 12.6 base images).
