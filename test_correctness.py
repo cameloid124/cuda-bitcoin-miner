@@ -3,7 +3,8 @@ Correctness tests for the CUDA SHA-256d miner.
 
 Validates against real Bitcoin block #125552 and against hashlib on random
 headers, and checks the host-side midstate/early-round precomputation and the
-double-buffered scanner. Requires a CUDA-capable GPU.
+double-buffered scanner. Requires a CUDA-capable GPU and kernels/sha256d_mine.ptx
+(or a matching cubin fallback).
 
 Run: python test_correctness.py
 """
@@ -11,13 +12,9 @@ import hashlib
 import os
 import struct
 
-import numpy as np
-import cupy as cp
-
-import cuda_kernel
 from cuda_kernel import (
-    GpuScanner, NONCES_PER_LAUNCH, MAX_RESULTS,
-    _sha256_compress, _precompute_job_words, _SHA256_IV,
+    GpuScanner, NONCES_PER_LAUNCH, gpu_check_single,
+    _sha256_compress, _SHA256_IV,
 )
 from miner import StratumMiner, diff_to_target, sha256d, DIFF1_TARGET, NTIME_ROLL
 
@@ -35,22 +32,6 @@ BLOCK_HEADER_HEX = (
     "f1fc122bc7f5d74df2b9441a42a14695"
 )
 
-# Single-nonce kernel harness (reused across tests)
-_d_job = cp.zeros(20, dtype=cp.uint32)
-_d_target = cp.zeros(8, dtype=cp.uint32)
-_d_results = cp.zeros(1 + MAX_RESULTS, dtype=cp.uint32)
-
-
-def gpu_check_single(prefix: bytes, nonce: int, target_int: int) -> bool:
-    """Runs the mining kernel for exactly one nonce; returns whether it was
-    reported as meeting the target."""
-    _d_job.set(_precompute_job_words(prefix))
-    _d_target.set(np.frombuffer(target_int.to_bytes(32, 'big'), dtype='>u4').astype(np.uint32))
-    _d_results.fill(0)
-    cuda_kernel._mine_kernel((1,), (1,), (_d_job, np.uint32(nonce), _d_target, _d_results))
-    cp.cuda.get_current_stream().synchronize()
-    return int(_d_results[0]) == 1
-
 
 def stratum_prevhash(rpc_hex: str) -> str:
     """Converts an RPC (display) block hash into Stratum notify format:
@@ -65,8 +46,6 @@ def nbits_to_target(nbits_hex: str) -> int:
 
 
 def test_host_sha256_matches_hashlib():
-    # For messages up to 55 bytes the padded message is a single 64-byte block,
-    # so one compression of that block equals the full SHA-256 digest.
     for length in range(0, 56):
         msg = os.urandom(length)
         block = msg + b'\x80' + b'\x00' * (55 - length) + struct.pack('>Q', length * 8)
@@ -76,7 +55,7 @@ def test_host_sha256_matches_hashlib():
 
 
 def test_header_packing():
-    merkle_root = bytes.fromhex(BLOCK_MERKLE_RPC)[::-1]  # header byte order
+    merkle_root = bytes.fromhex(BLOCK_MERKLE_RPC)[::-1]
     prefix = StratumMiner.pack_header_prefix(
         BLOCK_VERSION, stratum_prevhash(BLOCK_PREVHASH_RPC), merkle_root,
         BLOCK_NTIME, BLOCK_NBITS)
@@ -100,23 +79,20 @@ def test_gpu_finds_real_block_nonce(prefix: bytes):
 
 
 def test_scanner_finds_real_block_nonce(prefix: bytes):
-    """Full double-buffered scan of the batch containing the real nonce."""
     target = nbits_to_target(BLOCK_NBITS).to_bytes(32, 'big')
     scanner = GpuScanner()
     scanner.prepare_job(prefix, target)
 
     nonce_base = (BLOCK_NONCE // NONCES_PER_LAUNCH) * NONCES_PER_LAUNCH
     scanner.submit(nonce_base)
-    _, candidates = scanner.collect()
+    _, candidates, batch_best = scanner.collect()
     assert BLOCK_NONCE in candidates, f"scanner missed the real nonce, got {candidates}"
+    assert batch_best is not None, "scanner did not report batch best hash"
     print(f"[PASS] Double-buffered scanner found nonce 0x{BLOCK_NONCE:08x}")
 
 
 def test_scanner_pipeline_covers_space():
-    """Two batches in flight must return exactly their own nonce candidates,
-    in submission order, with no drops or duplicates."""
     prefix = os.urandom(76)
-    # Loose target (top byte 0x7f) so several nonces qualify per batch.
     target = (0x7fffffff << 224).to_bytes(32, 'big')
     scanner = GpuScanner()
     scanner.prepare_job(prefix, target)
@@ -128,12 +104,12 @@ def test_scanner_pipeline_covers_space():
 
     seen = []
     for expected_base in bases:
-        base, candidates = scanner.collect()
+        base, candidates, batch_best = scanner.collect()
         assert base == expected_base, "pipeline returned batches out of order"
+        assert batch_best is not None, "pipeline batch missing best hash"
         for n in candidates:
             assert expected_base <= n < expected_base + NONCES_PER_LAUNCH, \
                 "candidate nonce outside its batch range"
-            # CPU cross-check
             h = int.from_bytes(sha256d(prefix + struct.pack('<I', n)), 'little')
             assert h <= int.from_bytes(target, 'big'), "scanner reported a non-qualifying nonce"
         seen.extend(candidates)
@@ -143,8 +119,6 @@ def test_scanner_pipeline_covers_space():
 
 
 def test_kernel_vs_hashlib_random():
-    """Random headers: GPU digest must match hashlib exactly (target == digest
-    passes, target == digest-1 fails)."""
     for trial in range(50):
         prefix = os.urandom(76)
         nonce = int.from_bytes(os.urandom(4), 'little')
@@ -159,8 +133,6 @@ def test_kernel_vs_hashlib_random():
 
 
 def test_ntime_roll_headers_distinct():
-    """Rolling ntime must change the header (and thus the search space) while
-    keeping every other field intact."""
     prevhash = stratum_prevhash(BLOCK_PREVHASH_RPC)
     merkle_root = bytes.fromhex(BLOCK_MERKLE_RPC)[::-1]
     base = int(BLOCK_NTIME, 16)

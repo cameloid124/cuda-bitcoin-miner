@@ -49,6 +49,30 @@ def diff_to_target(difficulty: float) -> bytes:
     target_int = min(target_int, (1 << 256) - 1)
     return target_int.to_bytes(32, byteorder='big')
 
+def hash_to_difficulty(hash_int: int) -> float:
+    """Returns the Stratum difficulty implied by a share hash (as a LE integer)."""
+    if hash_int <= 0:
+        return float("inf")
+    return float(Fraction(DIFF1_TARGET) / Fraction(hash_int))
+
+def format_difficulty(difficulty: float) -> str:
+    """Formats a difficulty value for log output."""
+    if difficulty <= 0 or difficulty == float("inf"):
+        return "n/a"
+    if difficulty >= 1e12:
+        return f"{difficulty / 1e12:.2f}T"
+    if difficulty >= 1e9:
+        return f"{difficulty / 1e9:.2f}G"
+    if difficulty >= 1e6:
+        return f"{difficulty / 1e6:.2f}M"
+    if difficulty >= 1e3:
+        return f"{difficulty / 1e3:.2f}k"
+    if difficulty >= 100:
+        return f"{difficulty:.0f}"
+    if difficulty >= 1:
+        return f"{difficulty:.2f}"
+    return f"{difficulty:.4f}"
+
 def format_hashrate(hr: float) -> str:
     """Converts raw hashes/second into a human-readable string."""
     if hr > 1e12: return f"{hr/1e12:.2f} TH/s"
@@ -94,9 +118,16 @@ class StratumMiner:
         self.session_start_time = 0
         self.total_nonces_hashed = 0
         self.last_log_time = 0
+        self.best_difficulty = 0.0   # best share difficulty seen since startup
 
         # GPU
         self.scanner = GpuScanner()
+
+    def note_best_hash(self, hash_int: int):
+        """Updates session best from any qualifying hash (GPU batch or submit)."""
+        share_diff = hash_to_difficulty(hash_int)
+        if share_diff > self.best_difficulty and share_diff != float("inf"):
+            self.best_difficulty = share_diff
 
     async def run(self):
         """Main entry point with reconnect resiliency."""
@@ -140,6 +171,7 @@ class StratumMiner:
         self.session_start_time = time.time()
         self.total_nonces_hashed = 0
         self.last_log_time = time.time()
+        self.best_difficulty = 0.0
 
         if self._keepalive_task:
             self._keepalive_task.cancel()
@@ -403,10 +435,12 @@ class StratumMiner:
             await self.maybe_update_target()
 
             batch_start = time.perf_counter()
-            _, candidates = await asyncio.to_thread(self.scanner.collect)
+            _, candidates, batch_best = await asyncio.to_thread(self.scanner.collect)
             elapsed = time.perf_counter() - batch_start
 
             self.total_nonces_hashed += NONCES_PER_LAUNCH
+            if batch_best is not None:
+                self.note_best_hash(batch_best)
             self.log_telemetry(job_id, elapsed)
 
             for nonce in candidates:
@@ -436,9 +470,18 @@ class StratumMiner:
             logging.warning(f"[!] GPU candidate {nonce:08x} failed CPU verification, discarding.")
             return
 
+        share_diff = hash_to_difficulty(hash_int)
+        prev_best = self.best_difficulty
+        self.note_best_hash(hash_int)
+        new_best = share_diff > prev_best
+
         # Stratum expects nonce/ntime as big-endian hex strings
         nonce_hex = f"{nonce:08x}"
-        logging.info(f"[!] -> VALID NONCE FOUND: {nonce_hex} (hash: {hash_int:064x}) <-")
+        best_note = f", new session best {format_difficulty(share_diff)}" if new_best else ""
+        logging.info(
+            f"[!] -> VALID NONCE FOUND: {nonce_hex} "
+            f"(share diff: {format_difficulty(share_diff)}{best_note}) <-"
+        )
         await self.send_message("mining.submit", [
             self.username, job_id, extranonce2_hex, ntime, nonce_hex
         ], context={
@@ -460,6 +503,7 @@ class StratumMiner:
 
         logging.info(
             f"Job {job_id[:4]}... | Diff: {self.current_difficulty} | "
+            f"Best: {format_difficulty(self.best_difficulty)} | "
             f"Speed: {format_hashrate(instant_hr)} (Avg: {format_hashrate(session_hr)})"
         )
         self.last_log_time = current_time

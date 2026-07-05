@@ -1,30 +1,38 @@
 # Python + CUDA Bitcoin Miner (Proof of Concept)
 
 A Bitcoin (SHA-256d) Stratum V1 miner written in Python with a hand-tuned CUDA
-kernel, driven through [CuPy](https://cupy.dev/). This is a **proof of
-concept**: GPU mining of SHA-256 has been economically unviable for a decade
-(ASICs are ~5 orders of magnitude more efficient), but the project demonstrates
-a complete, protocol-correct mining stack in ~600 lines of code.
+kernel loaded via the CUDA Driver API (ctypes — **no CuPy, no NumPy**). This
+is a **proof of concept**: GPU mining of SHA-256 has been economically unviable
+for a decade (ASICs are ~5 orders of magnitude more efficient), but the project
+demonstrates a complete, protocol-correct mining stack in ~600 lines of Python
+plus a precompiled PTX module.
 
 ## Requirements
 
-- NVIDIA GPU with CUDA support (Maxwell or newer)
+- NVIDIA GPU with CUDA support (Turing / sm_75 or newer for the shipped PTX)
   - **Jetson (default):** Orin Nano / Orin NX / AGX Orin, JetPack **7.2**
     (L4T 39.2, CUDA 13.2)
-  - **x86_64:** desktop or server GPU, CUDA 12.x driver
-- Python 3.10+
-- CuPy (platform-specific — see [Native install](#native-install) or [Docker](#docker))
+  - **x86_64:** desktop or server GPU with a recent NVIDIA driver
+- Python 3.10+ (stdlib only at runtime)
+- NVIDIA driver (CUDA toolkit **not** required to run — only to rebuild the kernel)
 
 ## Usage
 
 ### Native install
 
 ```bash
-pip install -r requirements.txt -r requirements-jetson.txt   # Jetson / JetPack 7.2
-# or
-pip install -r requirements.txt -r requirements-x86.txt        # x86_64 / CUDA 12.x
-
 python miner.py -o stratum+tcp://pool.example.com:3333 -u WALLET.WORKER -p x
+```
+
+The repo ships `kernels/sha256d_mine.ptx` (plus optional `kernels/cubin/` fallbacks).
+The driver JIT-compiles PTX to native code on first launch (~1–3 s once per process).
+
+To rebuild the kernel after editing `kernels/sha256d_mine.cu`:
+
+```bash
+python build_kernel.py          # requires CUDA toolkit (nvcc)
+# or, dev-only fallback if nvcc is unavailable:
+python scripts/dev_build_via_nvrtc.py   # requires CuPy
 ```
 
 ### Docker
@@ -44,13 +52,8 @@ cp .env.example .env    # set STRATUM_URL, STRATUM_USER, STRATUM_PASSWORD
 docker compose up --build
 ```
 
-Builds `Dockerfile.jetson` (baseline: `nvcr.io/nvidia/pytorch:26.05-py3`, CUDA
-13.2.1 / Ubuntu 24.04, CuPy CUDA 13.x). From NGC PyTorch **26.03** onward
-NVIDIA no longer publishes separate `-igpu` container tags; Jetson Orin uses the
-same unified multi-arch image (see [PyTorch 26.05 release
-notes](https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-26-05.html)).
-The build strips any preinstalled CuPy from the base image before installing
-`cupy-cuda13x`.
+Builds `Dockerfile.jetson`. By default the image uses the **prebuilt** kernel
+artifacts committed in `kernels/` — no CUDA devel stage is pulled or built.
 
 **x86_64 desktop / server**
 
@@ -59,16 +62,27 @@ cp .env.example .env
 docker compose -f docker-compose.yml -f docker-compose.x86.yml up --build
 ```
 
-Builds `Dockerfile.x86` (CUDA 12.6 runtime, CuPy CUDA 12.x).
+Builds `Dockerfile.x86` (same prebuilt-kernels default).
+
+To recompile the kernel from source inside a CUDA devel builder stage instead
+(e.g. after editing `kernels/sha256d_mine.cu`), set `KERNEL_SOURCE=build`:
+
+```bash
+KERNEL_SOURCE=build docker compose up --build
+```
 
 Pool credentials are read from `.env` (`STRATUM_URL`, `STRATUM_USER`,
 `STRATUM_PASSWORD`). GPU passthrough is enabled via `runtime: nvidia` and
 `gpus: all`.
 
-| File | Platform | Base image | CuPy |
+| File | Platform | Runtime base image | Runtime deps |
 |---|---|---|---|
-| `Dockerfile.jetson` | ARM64 / Jetson | `nvcr.io/nvidia/pytorch:26.05-py3` | `cupy-cuda13x[ctk]` |
-| `Dockerfile.x86` | x86_64 | `nvidia/cuda:12.6.3-runtime-ubuntu22.04` | `cupy-cuda12x[ctk]` |
+| `Dockerfile.jetson` | ARM64 / Jetson | `nvcr.io/nvidia/cuda:13.2.0-base-ubuntu24.04` | Python 3 stdlib |
+| `Dockerfile.x86` | x86_64 | `nvidia/cuda:12.6.3-base-ubuntu22.04` | Python 3 stdlib |
+
+The runtime images use the CUDA **base** variant (a few hundred MB): the miner
+talks to the GPU through `libcuda.so.1`, injected by the NVIDIA container
+runtime, so cudart and the CUDA math libraries are not needed in the image.
 
 Optional `.env` overrides for the default (Jetson) stack:
 
@@ -76,6 +90,7 @@ Optional `.env` overrides for the default (Jetson) stack:
 MINER_DOCKERFILE=Dockerfile.jetson
 MINER_IMAGE_TAG=jetson
 DOCKER_PLATFORM=linux/arm64
+KERNEL_SOURCE=prebuilt
 ```
 
 ### Tests
@@ -103,11 +118,13 @@ python test_e2e.py           # full Stratum session against a built-in mock pool
 ┌──────────────────────────────────▼──────────────────  cuda_kernel.py ─┐
 │  GpuScanner            – double-buffered over 2 CUDA streams          │
 │  _precompute_job_words – host midstate + tail rounds 0-2 + schedule   │
-│                          constants, once per (extranonce2, ntime)     │
-│  sha256d_mine          – 32768 blocks × 512 threads = 2^24 nonces     │
-│                          per launch; 256 launches cover the full      │
-│                          32-bit nonce space                           │
-└──────────────────────────────────────────────────────────────────────┘
+│  cuda_driver.py        – ctypes → libcuda / nvcuda.dll (Driver API)   │
+└───────────────────────────────┬───────────────────────────────────────┘
+                                │ loads
+┌───────────────────────────────▼───────────────────────────────────────┐
+│  kernels/sha256d_mine.ptx  (primary)  or  kernels/cubin/sm_*.cubin    │
+│  sha256d_mine            – 32768 blocks × 512 threads = 2^24 nonces    │
+└───────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Stratum V1 layer (`miner.py`)
@@ -148,10 +165,12 @@ arithmetic — float division would truncate a 256-bit value to 53 bits).
 Header assembly is validated in `test_correctness.py` by byte-exact
 reconstruction of mainnet block #125552 from Stratum-formatted inputs.
 
-### CUDA kernel (`cuda_kernel.py`)
+### CUDA kernel (`kernels/sha256d_mine.cu`)
 
-The kernel is compiled at import time via NVRTC (`cp.RawModule`) for the
-native architecture of the active GPU. Key implementation traits:
+The kernel source is compiled offline to portable PTX (`kernels/sha256d_mine.ptx`)
+and loaded at startup through the CUDA Driver API (`cuda_driver.py`). If PTX JIT
+fails, a matching native cubin from `kernels/cubin/sm_XX.cubin` is tried. Key
+implementation traits:
 
 - **Midstate caching.** The first 64 bytes of the header (version, prevhash,
   28 bytes of merkle root) are constant across the whole nonce space, so their
@@ -201,7 +220,7 @@ native architecture of the active GPU. Key implementation traits:
 - All device buffers are allocated once and reused; per-launch traffic is a
   4-byte memset, the kernel launch, and a 68-byte result read.
 - `submit`/`collect` run in `asyncio.to_thread`, so the event loop keeps
-  servicing the Stratum socket while the GPU works (CuPy's synchronize
+  servicing the Stratum socket while the GPU works (stream synchronize
   releases the GIL). Stream ordering against the null-stream job/target
   uploads is preserved by draining the pipeline before preparing a new job.
 
@@ -216,16 +235,18 @@ bounded forward window.
 
 ### Platform notes
 
-- **JetPack 7.2** ships CUDA **13.2** and an ARM SBSA toolkit. Use the unified
-  NGC PyTorch **26.05+** container (`26.05-py3`, not `-igpu` — standalone iGPU
-  tags were discontinued from 26.03). Containers built for JetPack 6.x /
-  CUDA 12.6 are **not** compatible with JP 7.2 hosts.
-- **Jetson Orin** is compute capability **8.7**. The CUDA kernel is compiled at
-  import time via NVRTC for the active device, so no architecture-specific
-  binary is baked into the image.
-- **x86_64** hosts use a separate Dockerfile and CuPy CUDA 12.x stack; select
-  it with the `docker-compose.x86.yml` override rather than the default Jetson
-  compose file.
+- **Kernel artifacts.** PTX is built for virtual arch `compute_75` (Turing+).
+  The same `.ptx` file runs on Windows, Linux, and Jetson; the driver JITs it
+  per GPU. If the installed driver is older than the toolkit that produced the
+  PTX, the JIT fails and the loader automatically falls back to a matching
+  native cubin from `kernels/cubin/` (shipped for sm_75, sm_86, sm_87 —
+  Jetson Orin, sm_89, sm_90).
+- **JetPack 7.2** ships CUDA **13.2**. The Jetson runtime image is
+  `nvcr.io/nvidia/cuda:13.2.0-base-ubuntu24.04`; the optional kernel builder
+  stage (`KERNEL_SOURCE=build`) uses the matching `-devel-` variant.
+- **Jetson Orin** is compute capability **8.7**; desktop Ada (e.g. RTX 4060) is
+  **8.9**. Both JIT the shipped PTX without a rebuild.
+- **x86_64** hosts use `docker-compose.x86.yml` (CUDA 12.6 base images).
 
 ## Possible further optimizations
 

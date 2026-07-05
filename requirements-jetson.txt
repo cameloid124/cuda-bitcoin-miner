@@ -1,3 +1,0 @@
-# JetPack 7.2 (CUDA 13.2). [ctk] bundles NVRTC + runtime wheels for cp.RawModule.
--r requirements.txt
-cupy-cuda13x[ctk]>=13.0,<15.0

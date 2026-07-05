@@ -5,6 +5,10 @@ services:
     build:
       context: .
       dockerfile: ${MINER_DOCKERFILE:-Dockerfile.jetson}
+      args:
+        # prebuilt (default): use committed kernels/ artifacts, no CUDA devel stage.
+        # build: recompile PTX + cubins from source in a devel builder stage.
+        KERNEL_SOURCE: ${KERNEL_SOURCE:-prebuilt}
     image: python-cuda-miner:${MINER_IMAGE_TAG:-jetson}
     container_name: python-cuda-miner
     platform: ${DOCKER_PLATFORM:-linux/arm64}

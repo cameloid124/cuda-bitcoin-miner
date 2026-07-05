@@ -1,5 +1,26 @@
 # x86_64 desktop / server NVIDIA GPUs (CUDA 12.x).
-FROM nvidia/cuda:12.6.3-runtime-ubuntu22.04
+#
+# Kernel artifacts (PTX + cubins) ship prebuilt in the repo, so the CUDA devel
+# builder stage is skipped by default. To recompile from source instead:
+#   docker compose build --build-arg KERNEL_SOURCE=build
+ARG KERNEL_SOURCE=prebuilt
+
+FROM nvidia/cuda:12.6.3-devel-ubuntu22.04 AS kernels-build
+WORKDIR /app
+COPY build_kernel.py ./
+COPY kernels/ kernels/
+RUN python3 build_kernel.py
+
+FROM scratch AS kernels-prebuilt
+COPY kernels/ /app/kernels/
+
+# Alias resolved by KERNEL_SOURCE; BuildKit only builds the selected stage.
+FROM kernels-${KERNEL_SOURCE} AS kernels
+
+# Runtime: the miner is stdlib-only and drives the GPU through libcuda.so.1,
+# which the NVIDIA container runtime injects from the host. The CUDA "base"
+# image (no cudart/math libs) is therefore sufficient.
+FROM nvidia/cuda:12.6.3-base-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
@@ -8,16 +29,12 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 \
-    python3-pip \
-    cuda-nvrtc-12-6 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-COPY requirements.txt requirements-x86.txt ./
-RUN pip3 install --no-cache-dir -r requirements-x86.txt
-
-COPY miner.py cuda_kernel.py ./
+COPY --from=kernels /app/kernels/ kernels/
+COPY miner.py cuda_kernel.py cuda_driver.py ./
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
