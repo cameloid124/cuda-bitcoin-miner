@@ -142,12 +142,21 @@ class StratumMiner:
                 break
             except Exception as e:
                 logging.error(f"[!] Network connection lost: {e}. Reconnecting in 5 seconds...")
-                self.cancel_current_job()
+                await self.cancel_current_job()
                 await asyncio.sleep(5)
 
-    def cancel_current_job(self):
-        if self.current_job_task and not self.current_job_task.done():
-            self.current_job_task.cancel()
+    async def cancel_current_job(self):
+        """Cancel the active mining task and wait for GPU pipeline cleanup."""
+        task = self.current_job_task
+        if task is None or task.done():
+            self.current_job_task = None
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        self.current_job_task = None
 
     def _enable_tcp_keepalive(self):
         """Enable OS-level TCP keepalive so NAT/middleboxes don't drop idle sockets."""
@@ -188,7 +197,7 @@ class StratumMiner:
 
         self.authorized = True
         if self._pending_job:
-            self._start_job(self._pending_job)
+            await self._start_job(self._pending_job)
             self._pending_job = None
 
         self._keepalive_task = asyncio.create_task(self._keepalive_loop())
@@ -299,15 +308,15 @@ class StratumMiner:
 
         elif method == 'mining.notify':
             if allow_mining and self.authorized:
-                self._start_job(msg['params'])
+                await self._start_job(msg['params'])
             else:
                 self._pending_job = msg['params']
 
-    def _start_job(self, params):
+    async def _start_job(self, params):
         job_id = params[0]
         prevhash = params[1]
         clean_jobs = params[8]
-        self.cancel_current_job()
+        await self.cancel_current_job()
         if prevhash != self.last_prevhash:
             self.last_prevhash = prevhash
             block_hash = self.prevhash_display(prevhash)

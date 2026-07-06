@@ -112,7 +112,7 @@ async def main():
     try:
         await asyncio.wait_for(share_event.wait(), timeout=120)
     finally:
-        miner.cancel_current_job()
+        await miner.cancel_current_job()
         miner_task.cancel()
         if miner.writer:
             miner.writer.close()

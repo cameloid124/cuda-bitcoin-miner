@@ -9,6 +9,7 @@ import array
 import re
 import struct
 import subprocess
+import threading
 from collections import deque
 from ctypes import CDLL, addressof, c_uint32, create_string_buffer
 from pathlib import Path
@@ -175,6 +176,7 @@ class GpuScanner:
                            for p in self._h_results_ptr]
         self._in_flight = deque()
         self._next_slot = 0
+        self._lock = threading.RLock()
 
     @property
     def in_flight(self) -> int:
@@ -182,56 +184,66 @@ class GpuScanner:
 
     def prepare_job(self, header_prefix: bytes, target_bytes: bytes) -> None:
         """Uploads the precomputed constants for a new 76-byte header prefix."""
-        self.drain()
-        _upload_u32_array(self._cuda, self._d_job, _precompute_job_words(header_prefix))
-        self.set_target(target_bytes)
+        with self._lock:
+            self._drain_unlocked()
+            _upload_u32_array(self._cuda, self._d_job, _precompute_job_words(header_prefix))
+            _upload_u32_array(self._cuda, self._d_target, _target_bytes_to_words(target_bytes))
 
     def drain(self) -> None:
         """Synchronizes and discards every in-flight batch."""
+        with self._lock:
+            self._drain_unlocked()
+
+    def _drain_unlocked(self) -> None:
         while self._in_flight:
             slot, _ = self._in_flight.popleft()
             self._cuda.stream_sync(self._streams[slot])
 
     def set_target(self, target_bytes: bytes) -> None:
         """Uploads a new 32-byte big-endian share target."""
-        _upload_u32_array(self._cuda, self._d_target, _target_bytes_to_words(target_bytes))
+        with self._lock:
+            _upload_u32_array(self._cuda, self._d_target, _target_bytes_to_words(target_bytes))
 
     def submit(self, nonce_base: int) -> None:
         """Enqueues a batch scanning NONCES_PER_LAUNCH nonces from nonce_base."""
-        assert len(self._in_flight) < _PIPELINE_DEPTH, "pipeline full"
-        slot = self._next_slot
-        self._next_slot = (self._next_slot + 1) % _PIPELINE_DEPTH
-        stream = self._streams[slot]
+        with self._lock:
+            assert len(self._in_flight) < _PIPELINE_DEPTH, "pipeline full"
+            slot = self._next_slot
+            self._next_slot = (self._next_slot + 1) % _PIPELINE_DEPTH
+            stream = self._streams[slot]
 
-        self._cuda.memset_d32_async(self._d_results[slot], 0, _RESULT_WORDS, stream)
-        self._cuda.memset_d32_async(self._d_best_msb[slot], _HASH_MAX_WORD, 1, stream)
-        self._cuda.memset_d32_async(self._d_best_hash[slot], _HASH_MAX_WORD, _BEST_HASH_WORDS, stream)
-        self._cuda.launch_mine(
-            stream, _LAUNCH_GRID, _LAUNCH_BLOCK,
-            self._d_job, nonce_base, self._d_target,
-            self._d_results[slot], self._d_best_hash[slot], self._d_best_msb[slot],
-        )
-        self._cuda.memcpy_dtoh_async(
-            self._h_results_ptr[slot], self._d_results[slot], _RESULT_BYTES, stream)
+            self._cuda.memset_d32_async(self._d_results[slot], 0, _RESULT_WORDS, stream)
+            self._cuda.memset_d32_async(self._d_best_msb[slot], _HASH_MAX_WORD, 1, stream)
+            self._cuda.memset_d32_async(self._d_best_hash[slot], _HASH_MAX_WORD, _BEST_HASH_WORDS, stream)
+            self._cuda.launch_mine(
+                stream, _LAUNCH_GRID, _LAUNCH_BLOCK,
+                self._d_job, nonce_base, self._d_target,
+                self._d_results[slot], self._d_best_hash[slot], self._d_best_msb[slot],
+            )
+            self._cuda.memcpy_dtoh_async(
+                self._h_results_ptr[slot], self._d_results[slot], _RESULT_BYTES, stream)
 
-        self._in_flight.append((slot, nonce_base))
+            self._in_flight.append((slot, nonce_base))
 
     def collect(self):
         """Blocks until the oldest in-flight batch completes."""
-        slot, nonce_base = self._in_flight.popleft()
-        self._cuda.stream_sync(self._streams[slot])
-        res = self._h_results[slot]
-        count = min(int(res[0]), MAX_RESULTS)
+        with self._lock:
+            if not self._in_flight:
+                return 0, [], None
+            slot, nonce_base = self._in_flight.popleft()
+            self._cuda.stream_sync(self._streams[slot])
+            res = self._h_results[slot]
+            count = min(int(res[0]), MAX_RESULTS)
 
-        best_msb = c_uint32()
-        self._cuda.memcpy_dtoh(addressof(best_msb), self._d_best_msb[slot], 4)
-        batch_best = None
-        if best_msb.value != _HASH_MAX_WORD:
-            best_words = (c_uint32 * _BEST_HASH_WORDS)()
-            self._cuda.memcpy_dtoh(addressof(best_words), self._d_best_hash[slot], 32)
-            batch_best = state_words_to_hash_int(best_words)
+            best_msb = c_uint32()
+            self._cuda.memcpy_dtoh(addressof(best_msb), self._d_best_msb[slot], 4)
+            batch_best = None
+            if best_msb.value != _HASH_MAX_WORD:
+                best_words = (c_uint32 * _BEST_HASH_WORDS)()
+                self._cuda.memcpy_dtoh(addressof(best_words), self._d_best_hash[slot], 32)
+                batch_best = state_words_to_hash_int(best_words)
 
-        return nonce_base, [int(res[i]) for i in range(1, 1 + count)], batch_best
+            return nonce_base, [int(res[i]) for i in range(1, 1 + count)], batch_best
 
 
 # ---------------------------------------------------------------------------
