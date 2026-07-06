@@ -110,6 +110,7 @@ class StratumMiner:
         self.authorized = False
         self._pending_job = None
         self._keepalive_task = None
+        self.last_prevhash = None    # detects chain-tip changes across jobs
 
         # Asynchronous Task Management
         self.current_job_task = None
@@ -172,6 +173,7 @@ class StratumMiner:
         self.total_nonces_hashed = 0
         self.last_log_time = time.time()
         self.best_difficulty = 0.0
+        self.last_prevhash = None
 
         if self._keepalive_task:
             self._keepalive_task.cancel()
@@ -266,9 +268,8 @@ class StratumMiner:
 
         elif method == 'mining.submit':
             job_id = context.get("job_id", "?")
-            job_short = job_id[:8] + "..." if len(job_id) > 8 else job_id
             share_detail = (
-                f"job={job_short} nonce={context.get('nonce_hex', '?')} "
+                f"job={job_id} nonce={context.get('nonce_hex', '?')} "
                 f"extranonce2={context.get('extranonce2', '?')} ntime={context.get('ntime', '?')}"
             )
             if result:
@@ -304,9 +305,17 @@ class StratumMiner:
 
     def _start_job(self, params):
         job_id = params[0]
+        prevhash = params[1]
         clean_jobs = params[8]
         self.cancel_current_job()
-        logging.info(f"[+] Received New Job: {job_id[:8]}... (Clean: {clean_jobs})")
+        if prevhash != self.last_prevhash:
+            self.last_prevhash = prevhash
+            block_hash = self.prevhash_display(prevhash)
+            logging.info(
+                f"[+] New block on network: ..{block_hash.lstrip('0')[:12]} | "
+                f"Job: {job_id} (Clean: {clean_jobs})")
+        else:
+            logging.info(f"[*] Job refresh (same block): {job_id} (Clean: {clean_jobs})")
         self.current_job_task = asyncio.create_task(self.mine_job_loop(params))
 
     async def _keepalive_loop(self):
@@ -372,6 +381,13 @@ class StratumMiner:
         ntime_bin = struct.pack("<I", int(ntime, 16))
         nbits_bin = struct.pack("<I", int(nbits, 16))
         return version_bin + prevhash_bin + merkle_root + ntime_bin + nbits_bin
+
+    @staticmethod
+    def prevhash_display(prevhash: str) -> str:
+        """Converts Stratum's word-swapped prevhash to block-explorer display order."""
+        raw = bytes.fromhex(prevhash)
+        header_order = b''.join(raw[i:i+4][::-1] for i in range(0, 32, 4))
+        return header_order[::-1].hex()
 
     # -------------------------------------------------------------------
     # MINING LOOP
@@ -502,7 +518,7 @@ class StratumMiner:
         session_hr = (self.total_nonces_hashed / session_elapsed) if session_elapsed > 0 else 0
 
         logging.info(
-            f"Job {job_id[:4]}... | Diff: {self.current_difficulty} | "
+            f"Job ..{job_id[-4:]} | Diff: {self.current_difficulty} | "
             f"Best: {format_difficulty(self.best_difficulty)} | "
             f"Speed: {format_hashrate(instant_hr)} (Avg: {format_hashrate(session_hr)})"
         )
